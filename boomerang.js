@@ -3151,6 +3151,12 @@ BOOMR_check_doc_domain();
 				}
 			}
 
+			
+			//WDH
+            impl.vars["sessionid"] = BOOMR.window.BOOMR_sessionid;
+            impl.vars["traceid"] = BOOMR.window.BOOMR_traceid;
+            impl.vars["appuuid"] = BOOMR.window.BOOMR_appuuid;
+
 			impl.vars["ua.plt"] = navigator.platform;
 			impl.vars["ua.vnd"] = navigator.vendor;
 
