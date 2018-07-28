@@ -6,26 +6,43 @@
 //
 var chai = require("chai");
 var assert = chai.assert;
+var path = require("path");
 
-var tests = require("./e2e.json");
+var testsFile = path.join(__dirname, "e2e.json");
+var tests = require(testsFile).tests;
+var servers = require(testsFile).server;
+var ports = require(testsFile).ports;
+
 var disabledTests = require("./e2e.disabled.json");
 
 //
 // Functions
 //
-function run(path, file) {
-	describe(path, function() {
+function run(testPath, file) {
+	describe(testPath, function() {
 		var fileName = file + ".html";
-		it("Should pass " + path + "/" + fileName, function(done) {
-			browser.driver.get("http://localhost:4002/pages/" + path + "/" + fileName);
+
+		it("Should pass " + testPath + "/" + fileName, function(done) {
+
+			if (typeof browser.waitForAngularEnabled === "function") {
+				browser.waitForAngularEnabled(false);
+			}
+
+			console.log(
+				"Navigating to",
+				"http://" + servers.main + ":" + ports.main + "/pages/" + testPath + "/" + fileName
+			);
+
+			browser.driver.get("http://" + servers.main + ":" + ports.main + "/pages/" + testPath + "/" + fileName);
 
 			browser.driver.wait(function() {
-				return browser.driver.isElementPresent(by.css("#BOOMR_test_complete"));
+				return element(by.css("#BOOMR_test_complete")).isPresent();
 			});
 
-			browser.driver.executeScript("return BOOMR_test.isComplete()").then(function(complete){
+			browser.driver.executeScript("return BOOMR_test.isComplete()").then(function(complete) {
 				assert.equal(complete, true, "BOOMR_test.isComplete()");
-				browser.driver.executeScript("return BOOMR_test.getTestFailureMessages()").then(function(testFailures){
+
+				browser.driver.executeScript("return BOOMR_test.getTestFailureMessages()").then(function(testFailures) {
 					if (testFailures.length > 0) {
 						throw new Error(testFailures);
 					}

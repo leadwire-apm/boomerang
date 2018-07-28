@@ -15,45 +15,64 @@ BOOMR_test.templates.SPA["00-simple"] = function() {
 	});
 
 	it("Should take as long as the longest img load (if MutationObserver and NavigationTiming are supported)", function() {
-		if (window.MutationObserver && typeof BOOMR.plugins.RT.navigationStart() !== "undefined") {
+		if (t.isMutationObserverSupported() && typeof BOOMR.plugins.RT.navigationStart() !== "undefined") {
 			t.validateBeaconWasSentAfter(0, "img.jpg", 100, 3000, 30000, true);
+		}
+		else {
+			return this.skip();
 		}
 	});
 
 	it("Should have a t_resp of the root page (if MutationObserver and NavigationTiming are supported)", function() {
-		if (window.MutationObserver && typeof BOOMR.plugins.RT.navigationStart() !== "undefined") {
+		if (t.isMutationObserverSupported() && typeof BOOMR.plugins.RT.navigationStart() !== "undefined") {
 			var pt = window.performance.timing;
 			var b = tf.lastBeacon();
-			assert.equal(b.t_resp, pt.responseStart - pt.fetchStart);
+			assert.equal(b.t_resp, pt.responseStart - pt.navigationStart);
+		}
+		else {
+			return this.skip();
 		}
 	});
 
 	it("Should have a t_page of total - t_resp (if MutationObserver and NavigationTiming are supported)", function() {
-		if (window.MutationObserver && typeof BOOMR.plugins.RT.navigationStart() !== "undefined") {
+		if (t.isMutationObserverSupported() && typeof BOOMR.plugins.RT.navigationStart() !== "undefined") {
 			var pt = window.performance.timing;
 			var b = tf.lastBeacon();
 			assert.equal(b.t_page, b.t_done - b.t_resp);
 		}
+		else {
+			return this.skip();
+		}
 	});
 
 	it("Should not have a load time (if MutationObserver is supported but NavigationTiming is not)", function() {
-		if (window.MutationObserver && typeof BOOMR.plugins.RT.navigationStart() === "undefined") {
+		if (t.isMutationObserverSupported() && typeof BOOMR.plugins.RT.navigationStart() === "undefined") {
 			var b = tf.lastBeacon();
 			assert.equal(b.t_done, undefined);
+		}
+		else {
+			return this.skip();
 		}
 	});
 
 	it("Should take as long as the XHRs (if MutationObserver is not supported but NavigationTiming is)", function() {
-		if (typeof window.MutationObserver === "undefined" && typeof BOOMR.plugins.RT.navigationStart() !== "undefined") {
+		if (!t.isMutationObserverSupported() && typeof BOOMR.plugins.RT.navigationStart() !== "undefined") {
+			// this fails in react, onload happens later than the XHR
 			t.validateBeaconWasSentAfter(0, "widgets.json", 100, 0, 30000, true);
+		}
+		else {
+			return this.skip();
 		}
 	});
 
 	it("Shouldn't have a load time (if MutationObserver and NavigationTiming are not supported)", function() {
-		if (typeof window.MutationObserver === "undefined" && typeof BOOMR.plugins.RT.navigationStart() === "undefined") {
+		if (!t.isMutationObserverSupported() && typeof BOOMR.plugins.RT.navigationStart() === "undefined") {
 			var b = tf.lastBeacon();
 			assert.equal(b.t_done, undefined);
 			assert.equal(b["rt.start"], "none");
+		}
+		else {
+			return this.skip();
 		}
 	});
 
@@ -63,13 +82,13 @@ BOOMR_test.templates.SPA["00-simple"] = function() {
 	});
 
 	it("Should have NavigationTiming metrics (if MutationObserver and NavigationTiming are supported)", function() {
-		if (typeof window.MutationObserver !== "undefined" && typeof BOOMR.plugins.RT.navigationStart() !== "undefined") {
+		if (t.isMutationObserverSupported() && typeof BOOMR.plugins.RT.navigationStart() !== "undefined") {
 			var b = tf.lastBeacon();
-			assert.isDefined(b.nt_red_cnt);
+			assert.equal(b.nt_red_cnt, 0);  // no redirects
 			assert.isDefined(b.nt_nav_type);
 			assert.isDefined(b.nt_nav_st);
-			assert.isDefined(b.nt_red_st);
-			assert.isDefined(b.nt_red_end);
+			assert.isUndefined(b.nt_red_st);  // no redirects
+			assert.isUndefined(b.nt_red_end);  // no redirects
 			assert.isDefined(b.nt_fet_st);
 			assert.isDefined(b.nt_dns_st);
 			assert.isDefined(b.nt_dns_end);
@@ -87,6 +106,9 @@ BOOMR_test.templates.SPA["00-simple"] = function() {
 			assert.isDefined(b.nt_load_end);
 			assert.isDefined(b.nt_unload_st);
 			assert.isDefined(b.nt_unload_end);
+		}
+		else {
+			return this.skip();
 		}
 	});
 

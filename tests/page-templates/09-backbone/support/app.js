@@ -81,9 +81,11 @@ app.HomeView = Backbone.View.extend({
 				var template = Handlebars.compile(app.TEMPLATES.home);
 
 				var imgs = typeof window.backbone_imgs !== "undefined" ? window.backbone_imgs : [0];
+				var hide_imgs = imgs[0] === -1;
 
 				that.$el.html(template({
 					imgs: imgs,
+					hide_imgs: hide_imgs,
 					widgets: app.widgets.toJSON(),
 					rnd: Math.random()
 				}));
@@ -124,13 +126,25 @@ app.WidgetView = Backbone.View.extend({
 					rnd: Math.random()
 				},
 				success: function() {
+					// these overwrite what was in the HTML
+					window.custom_metric_1 = that.model.id;
+					window.custom_metric_2 = function() {
+						return 10 * that.model.id;
+					};
+
+					window.custom_timer_1 = that.model.id;
+					window.custom_timer_2 = function() {
+						return 10 * that.model.id;
+					};
+
 					var widget = app.widgets.get(that.model.id).toJSON();
 
 					var template = Handlebars.compile(widgetTemplate);
 
 					that.$el.html(template({
 						widget: widget,
-						rnd: Math.random()
+						rnd: Math.random(),
+						carttotal: 11.11 * that.model.id
 					}));
 				}
 			});
@@ -206,7 +220,7 @@ if (!window.backbone_delay_startup) {
 if (typeof window.backbone_nav_routes !== "undefined" &&
 	Object.prototype.toString.call(window.backbone_nav_routes) === "[object Array]") {
 
-	BOOMR.subscribe("onbeacon", function(beacon) {
+	BOOMR.subscribe("beacon", function(beacon) {
 		// only continue for SPA beacons
 		if (!BOOMR.utils.inArray(beacon["http.initiator"], BOOMR.constants.BEACON_TYPE_SPAS)) {
 			return;

@@ -1,5 +1,7 @@
 {
     "plugins": [
+        "plugins/continuity.js",
+        "plugins/iframe-delay.js",
         "plugins/auto-xhr.js",
         "plugins/spa.js",
         "plugins/angular.js",
@@ -8,6 +10,7 @@
         "plugins/history.js",
         "plugins/rt.js",
         "plugins/bw.js",
+        "plugins/painttiming.js",
         "plugins/navtiming.js",
         "plugins/restiming.js",
         "plugins/mobile.js",

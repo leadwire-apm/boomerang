@@ -1,16 +1,116 @@
 /**
-\file restiming.js
-Plugin to collect metrics from the W3C Resource Timing API.
-For more information about Resource Timing,
-see: http://www.w3.org/TR/resource-timing/
-*/
-
+ * Plugin to collect metrics from the W3C [ResourceTiming]{@link http://www.w3.org/TR/resource-timing/}
+ * API.
+ *
+ * For information on how to include this plugin, see the {@tutorial building} tutorial.
+ *
+ * ## Beacon Parameters
+ *
+ * This plugin adds the following parameters to the beacon for Page Loads:
+ *
+ * * `restiming`: Compressed ResourceTiming data
+ *
+ * The ResourceTiming plugin adds an object named `restiming` to the beacon data.
+ *
+ *  `restiming` is an optimized [Trie]{@link http://en.wikipedia.org/wiki/Trie} structure,
+ * where the keys are the ResourceTiming URLs, and the values correspond to those URLs'
+ * [PerformanceResourceTiming]{@link http://www.w3.org/TR/resource-timing/#performanceresourcetiming}
+ * timestamps:
+ *
+ *     { "[url]": "[data]"}
+ *
+ * The Trie structure is used to minimize the data transmitted from the ResourceTimings.
+ *
+ * Keys in the Trie are the ResourceTiming URLs. For example, with a root page and three resources:
+ *
+ * * http://abc.com/
+ * * http://abc.com/js/foo.js
+ * * http://abc.com/css/foo.css
+ * * http://abc.com/css/foo.png (downloaded twice)
+ *
+ * Then the Trie might look like this:
+ *
+ *     // Example 1
+ *     {
+ *       "http://abc.com/":
+ *       {
+ *         "|": "0,2",
+ *         "js/foo.js": "3a,1",
+ *         "css/": {
+ *           "foo.css": "2b,2",
+ *           "foo.png": "1c,3|1d,a"
+ *         }
+ *       }
+ *     }
+ *
+ * If a resource's URL is a prefix of another resource, then it terminates with a
+ * pipe symbol (`|`). In Example 1, `http://abc.com` (the root page) is a
+ * prefix of `http://abc.com/js/foo.js`, so it is listed as `http://abc.com|` in
+ * the Trie.
+ *
+ * If there is more than one ResourceTiming entry for a URL, each entry is
+ * separated by a pipe symbol (`|`) in the `data`. In Example 1 above, `foo.png`
+ * has been downloaded twice, so it is listed with two separate page loads, `1c,3` and `1d,a`.
+ *
+ * The value of each key is a string, which contains the following components:
+ *
+ *     data = "[initiatorType][timings]"
+ *
+ * `initiatorType` is a simple map from the PerformanceResourceTiming
+ * `initiatorType` (which is a string) to an integer, according to the
+ * {@link BOOMR.plugins.ResourceTiming.INITAITOR_TYPES} enum.
+ *
+ * `timings` is a string of [Base-36]{@link http://en.wikipedia.org/wiki/Base_36}
+ * encoded timestamps from the PerformanceResourceTiming interface. The values in
+ * the string are separated by commas:
+ *
+ *     timings = "[startTime],[responseEnd],[responseStart],[requestStart],[connectEnd],[secureConnectionStart],[connectStart],[domainLookupEnd],[domainLookupStart],[redirectEnd],[redirectStart]"
+ *
+ * `startTime` is a [DOMHighResTimeStamp]{@link http://www.w3.org/TR/hr-time/#domhighrestimestamp}
+ * from when the resource started (Base 36).
+ *
+ * All other timestamps are offsets (rounded to milliseconds) from `startTime`
+ * (Base 36). For example, `responseEnd` is calculated as:
+ *
+ *     responseEnd: base36(round(responseEnd - startTime))
+ *
+ * If the resulting timestamp is `0`, it is replaced with an empty string (`""`).
+ *
+ * All trailing commas are removed from the final string. This compresses the timing
+ * string from timestamps that are often `0`. For example, here is what a fully-redirected
+ * resource might look like:
+ *
+ *     { "http://abc.com/this-resource-was-redirected": "01,1,1,1,1,1,1,1,1,1,1" }
+ *
+ * While a resource that was loaded from the cache (and thus only has `startTime`
+ * and `responseEnd` timestamps) might look like this:
+ *
+ *     { "http://abc.com/this-resource-was-redirected": "01,1" }
+ *
+ * Note that some of the metrics are restricted and will not be provided cross-origin
+ * unless the Timing-Allow-Origin header permits.
+ *
+ * Putting this all together, let's look at `http://abc.com/css/foo.png` in Example 1.
+ * We find it was downloaded twice `"1c,3|1d,a"`:
+ *
+ * * 1c,3:
+ *     * `1`: `initiatorType` = `1` (IMG)
+ *     * `c`: `startTime` = `c` (12ms)
+ *     * `3`: `responseEnd` = `3` (3ms from startTime, or at 15ms)
+ * * 1d,a:
+ *     * `1`: `initiatorType` = `1` (IMG)
+ *     * `d`: `startTime` = `d` (13ms)
+ *     * `2`: `responseEnd` = `a` (10ms from startTime, or at 23ms)
+ *
+ * @see {@link http://www.w3.org/TR/resource-timing/}
+ * @class BOOMR.plugins.ResourceTiming
+ */
 (function() {
-
 	var impl;
 
-	BOOMR = BOOMR || {};
+	BOOMR = window.BOOMR || {};
 	BOOMR.plugins = BOOMR.plugins || {};
+
 	if (BOOMR.plugins.ResourceTiming) {
 		return;
 	}
@@ -18,20 +118,52 @@ see: http://www.w3.org/TR/resource-timing/
 	//
 	// Constants
 	//
+
+	/**
+	 * @enum {number}
+	 * @memberof BOOMR.plugins.ResourceTiming
+	 */
 	var INITIATOR_TYPES = {
+		/** Unknown type */
 		"other": 0,
+		/** IMG element */
 		"img": 1,
+		/** LINK element (i.e. CSS) */
 		"link": 2,
+		/** SCRIPT element */
 		"script": 3,
+		/** Resource referenced in CSS */
 		"css": 4,
+		/** XMLHttpRequest */
 		"xmlhttprequest": 5,
+		/** The root HTML page itself */
 		"html": 6,
-		// IMAGE element inside a SVG
+		/** IMAGE element inside a SVG */
 		"image": 7,
-		// sendBeacon: https://developer.mozilla.org/en-US/docs/Web/API/Navigator/sendBeacon
+		/** [sendBeacon]{@link https://developer.mozilla.org/en-US/docs/Web/API/Navigator/sendBeacon} */
 		"beacon": 8,
-		// Fetch API: https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API
-		"fetch": 9
+		/** [Fetch API]{@link https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API} */
+		"fetch": 9,
+		/** An IFRAME */
+		"iframe": "a",
+		/** IE11 and Edge (some versions) send "subdocument" instead of "iframe" */
+		"subdocument": "a"
+	};
+
+	/**
+	 * These are the only `rel` types that might be reference-able from
+	 * ResourceTiming.
+	 *
+	 * https://html.spec.whatwg.org/multipage/links.html#linkTypes
+	 *
+	 * @enum {number}
+	 * @memberof BOOMR.plugins.ResourceTiming
+	 */
+	var REL_TYPES = {
+		"prefetch": 1,
+		"preload": 2,
+		"prerender": 3,
+		"stylesheet": 4
 	};
 
 	// Words that will be broken (by ensuring the optimized trie doesn't contain
@@ -65,6 +197,12 @@ see: http://www.w3.org/TR/resource-timing/
 	var DEFER_ATTR = 0x2;
 	var LOCAT_ATTR = 0x4;	// 0 => HEAD, 1 => BODY
 
+	// Dimension data special type
+	var SPECIAL_DATA_SERVERTIMING_TYPE = "3";
+
+	// Link attributes
+	var SPECIAL_DATA_LINK_ATTR_TYPE = "4";
+
 	/**
 	 * Converts entries to a Trie:
 	 * http://en.wikipedia.org/wiki/Trie
@@ -78,8 +216,8 @@ see: http://www.w3.org/TR/resource-timing/
 	 *
 	 * If key A is a prefix to key B, key A will be suffixed with "|"
 	 *
-	 * @param [object] entries Performance entries
-	 * @return A trie
+	 * @param {object} entries Performance entries
+	 * @returns {object} A trie
 	 */
 	function convertToTrie(entries) {
 		var trie = {}, url, urlFixed, i, value, letters, letter, cur, node;
@@ -134,8 +272,10 @@ see: http://www.w3.org/TR/resource-timing/
 	/**
 	 * Optimize the Trie by combining branches with no leaf
 	 *
-	 * @param [object] cur Current Trie branch
-	 * @param [boolean] top Whether or not this is the root node
+	 * @param {object} cur Current Trie branch
+	 * @param {boolean} top Whether or not this is the root node
+	 *
+	 * @returns {object} Optimized Trie
 	 */
 	function optimizeTrie(cur, top) {
 		var num = 0, node, ret, topNode;
@@ -203,7 +343,7 @@ see: http://www.w3.org/TR/resource-timing/
 	 *
 	 * @param [number] time Time
 	 * @param [number] startTime Start time
-	 * @return [number] Number of ms from start time
+	 * @returns [number] Number of ms from start time
 	 */
 	function trimTiming(time, startTime) {
 		if (typeof time !== "number") {
@@ -222,9 +362,13 @@ see: http://www.w3.org/TR/resource-timing/
 	}
 
 	/**
-	 * Checks if the current execution context can haz cheezburger from the specified frame
+	 * Checks if the current execution context can access the specified frame.
+	 *
+	 * Note: In Safari, this will still produce a console error message, even
+	 * though the exception is caught.
+
 	 * @param {Window} frame The frame to check if access can haz
-	 * @return {boolean} true if true, false otherwise
+	 * @returns {boolean} true if true, false otherwise
 	 */
 	function isFrameAccessible(frame) {
 		var dummy;
@@ -273,11 +417,11 @@ see: http://www.w3.org/TR/resource-timing/
 	 * @param {string} offset Offset in timing from root IFRAME
 	 * @param {number} depth Recursion depth
 	 * @param {number[]} [frameDims] position and size of the frame if it is visible as returned by getVisibleEntries
-	 * @return {PerformanceEntry[]} Performance entries
+	 * @returns {PerformanceEntry[]} Performance entries
 	 */
 	function findPerformanceEntriesForFrame(frame, isTopWindow, offset, depth, frameDims) {
 		var entries = [], i, navEntries, navStart, frameNavStart, frameOffset, subFrames, subFrameDims,
-		    navEntry, t, rtEntry, visibleEntries, scripts = {}, a;
+		    navEntry, t, rtEntry, visibleEntries, scripts = {}, links = {}, a;
 
 		if (typeof isTopWindow === "undefined") {
 			isTopWindow = true;
@@ -308,16 +452,8 @@ see: http://www.w3.org/TR/resource-timing/
 			a = frame.document.createElement("a");
 
 			// get all scripts as an object keyed on script.src
-			Array.prototype
-				.forEach
-				.call(frame.document.getElementsByTagName("script"), function(s) {
-					a.href = s.src;	// Get canonical URL
-
-					// only get external scripts
-					if (a.href.match(/^https?:\/\//)) {
-						scripts[a.href] = s;
-					}
-				});
+			collectResources(a, scripts, "script");
+			collectResources(a, links, "link");
 
 			subFrames = frame.document.getElementsByTagName("iframe");
 
@@ -332,12 +468,16 @@ see: http://www.w3.org/TR/resource-timing/
 
 					a.href = subFrames[i].src;	// Get canonical URL
 
-					entries = entries.concat(findPerformanceEntriesForFrame(frame.frames[i], false, frameOffset, depth + 1, visibleEntries[a.href]));
+					entries = entries.concat(findPerformanceEntriesForFrame(subFrames[i].contentWindow, false, frameOffset, depth + 1, visibleEntries[a.href]));
 				}
 			}
 
 			if (typeof frame.performance.getEntriesByType !== "function") {
 				return entries;
+			}
+
+			function readServerTiming(entry) {
+				return (impl.serverTiming && entry.serverTiming) || [];
 			}
 
 			// add an entry for the top page
@@ -365,7 +505,8 @@ see: http://www.w3.org/TR/resource-timing/
 						workerStart: navEntry.workerStart,
 						encodedBodySize: navEntry.encodedBodySize,
 						decodedBodySize: navEntry.decodedBodySize,
-						transferSize: navEntry.transferSize
+						transferSize: navEntry.transferSize,
+						serverTiming: readServerTiming(navEntry)
 					});
 				}
 				else if (frame.performance.timing) {
@@ -425,12 +566,13 @@ see: http://www.w3.org/TR/resource-timing/
 					encodedBodySize: t.encodedBodySize,
 					decodedBodySize: t.decodedBodySize,
 					transferSize: t.transferSize,
+					serverTiming: readServerTiming(t),
 					visibleDimensions: visibleEntries[t.name],
 					latestTime: getResourceLatestTime(t)
 				};
 
 				// If this is a script, set its flags
-				if (t.initiatorType === "script" && scripts[t.name]) {
+				if ((t.initiatorType === "script" || t.initiatorType === "link") && scripts[t.name]) {
 					var s = scripts[t.name];
 
 					// Add async & defer based on attribute values
@@ -442,6 +584,21 @@ see: http://www.w3.org/TR/resource-timing/
 
 					// Add location by traversing up the tree until we either hit BODY or document
 					rtEntry.scriptAttrs |= (s.nodeName === "BODY" ? LOCAT_ATTR : 0);
+				}
+
+				// If this is a link, set its flags
+				if (t.initiatorType === "link" && links[t.name]) {
+					// split on ASCII whitespace
+					BOOMR.utils.arrayFind(links[t.name].rel.split(/[\u0009\u000A\u000C\u000D\u0020]+/), function(rel) { //eslint-disable-line no-loop-func
+						// `rel`s are case insensitive
+						rel = rel.toLowerCase();
+
+						// only report the `rel` if it's from the known list
+						if (REL_TYPES[rel]) {
+							rtEntry.linkAttrs = REL_TYPES[rel];
+							return true;
+						}
+					});
 				}
 
 				frameFixedEntries.push(rtEntry);
@@ -456,6 +613,27 @@ see: http://www.w3.org/TR/resource-timing/
 		return entries;
 	}
 
+    /**
+	 * Collect external resources by tagName
+	 *
+	 * @param [Element] a an anchor element
+	 * @param [Object] obj object of resources where the key is the url
+	 * @param [string] tagName tag name to collect
+	 */
+	function collectResources(a, obj, tagName) {
+		Array.prototype
+			.forEach
+			.call(a.ownerDocument.getElementsByTagName(tagName), function(r) {
+				// Get canonical URL
+				a.href = r.src || r.href;
+
+				// only get external resource
+				if (a.href.match(/^https?:\/\//)) {
+					obj[a.href] = r;
+				}
+			});
+	}
+
 	/**
 	 * Converts a number to base-36.
 	 *
@@ -466,7 +644,7 @@ see: http://www.w3.org/TR/resource-timing/
 	 * If a string, return a string.
 	 *
 	 * @param [number] n Number
-	 * @return Base-36 number, empty string, or string
+	 * @returns {string} Base-36 number, empty string, or string
 	 */
 	function toBase36(n) {
 		return (typeof n === "number" && n !== 0) ?
@@ -480,7 +658,7 @@ see: http://www.w3.org/TR/resource-timing/
 	 *
 	 * @param {Window} win Window to search
 	 * @param {number[]} [winDims] position and size of the window if it is an embedded iframe in the format returned by this function
-	 * @return {Object} Object with URLs of visible assets as keys, and Array[height, width, top, left, naturalHeight, naturalWidth] as value
+	 * @returns {Object} Object with URLs of visible assets as keys, and Array[height, width, top, left, naturalHeight, naturalWidth] as value
 	 */
 	function getVisibleEntries(win, winDims) {
 		// lower-case tag names should be used: https://developer.mozilla.org/en-US/docs/Web/API/Element/getElementsByTagName
@@ -540,18 +718,23 @@ see: http://www.w3.org/TR/resource-timing/
 
 	/**
 	 * Gathers a filtered list of performance entries.
-	 * @param [number] from Only get timings from
-	 * @param [number] to Only get timings up to
-	 * @param [string[]] initiatorTypes Array of initiator types
-	 * @return [ResourceTiming[]] Matching ResourceTiming entries
+	 *
+	 * @param {number} from Only get timings from
+	 * @param {number} to Only get timings up to
+	 * @param {string[]} initiatorTypes Array of initiator types
+	 *
+	 * @returns {ResourceTiming[]} Matching ResourceTiming entries
+	 * @memberof BOOMR.plugins.ResourceTiming
 	 */
 	function getFilteredResourceTiming(from, to, initiatorTypes) {
 		var entries = findPerformanceEntriesForFrame(BOOMR.window, true, 0, 0),
 		    i, e, results = {}, initiatorType, url, data,
-		    navStart = getNavStartTime(BOOMR.window);
+		    navStart = getNavStartTime(BOOMR.window), countCollector = {};
 
 		if (!entries || !entries.length) {
-			return [];
+			return {
+				entries: []
+			};
 		}
 
 		// sort entries by start time
@@ -595,18 +778,26 @@ see: http://www.w3.org/TR/resource-timing/
 				}
 			}
 
+			accumulateServerTimingEntries(countCollector, e.serverTiming);
 			filteredEntries.push(e);
 		}
 
-		return filteredEntries;
+		var lookup = compressServerTiming(countCollector);
+		return {
+			entries: filteredEntries,
+			serverTiming: {
+				lookup: lookup,
+				indexed: indexServerTiming(lookup)
+			}
+		};
 	}
 
 	/**
 	 * Gets compressed content and transfer size information, if available
 	 *
-	 * @param [ResourceTiming] resource ResourceTiming bject
+	 * @param {ResourceTiming} resource ResourceTiming object
 	 *
-	 * @returns [string] Compressed data (or empty string, if not available)
+	 * @returns {string} Compressed data (or empty string, if not available)
 	 */
 	function compressSize(resource) {
 		var sTrans, sEnc, sDec, sizes;
@@ -707,7 +898,7 @@ see: http://www.w3.org/TR/resource-timing/
 	/**
 	 * Decompress compressed timepoints into a timepoint object with painted and finalized pixel counts
 	 * @param {string} comp The compressed timePoint object returned by getOptimizedTimepoints
-	 * @return {object} An object in the form { <timePoint>: [ <pixel count>, <finalized pixel count>], ... }
+	 * @returns {object} An object in the form { <timePoint>: [ <pixel count>, <finalized pixel count>], ... }
 	 */
 	function decompressTimePoints(comp) {
 		var result = {}, timePoints, i, split, prevs = [0, 0, 0];
@@ -747,7 +938,7 @@ see: http://www.w3.org/TR/resource-timing/
 	 *
 	 * @param {string} url URL to trim
 	 * @param {string} urlsToTrim List of URLs (strings or regexs) to trim
-	 * @return {string} Trimmed URL
+	 * @returns {string} Trimmed URL
 	 */
 	function trimUrl(url, urlsToTrim) {
 		var i, urlIdx, trim;
@@ -780,7 +971,7 @@ see: http://www.w3.org/TR/resource-timing/
 	/**
 	 * Get the latest timepoint for this resource from ResourceTiming. If the resource hasn't started downloading yet, return Infinity
 	 * @param {PerformanceResourceEntry} res The resource entry to get the latest time for
-	 * @return {number} latest timepoint for the resource or now if the resource is still in progress
+	 * @returns {number} latest timepoint for the resource or now if the resource is still in progress
 	 */
 	function getResourceLatestTime(res) {
 		// If responseEnd is non zero, return it
@@ -804,7 +995,7 @@ see: http://www.w3.org/TR/resource-timing/
 	 * @param {number[][]} currentPixels A 2D sparse array of numbers representing set pixels or undefined if no pixels are currently set.
 	 * @param {number[][]} dimList A list of rectangular dimension tuples in the form [height, width, top, left] for resources to be painted on the virtual screen
 	 * @param {number} pixelValue The numeric value to set all new pixels to
-	 * @return {number[][]} An updated version of currentPixels.
+	 * @returns {number[][]} An updated version of currentPixels.
 	 */
 	function mergePixels(currentPixels, dimList, pixelValue) {
 		var s = BOOMR.window.screen,
@@ -849,7 +1040,7 @@ see: http://www.w3.org/TR/resource-timing/
 	 * @param {number[][]} pixels A 2D boolean array representing the screen with painted pixels set to true
 	 * @param {number} [rangeMin] If included, will only count pixels >= this value
 	 * @param {number} [rangeMax] If included, will only count pixels <= this value
-	 * @return {number} The number of pixels set in the passed in array
+	 * @returns {number} The number of pixels set in the passed in array
 	 */
 	function countPixels(pixels, rangeMin, rangeMax) {
 		rangeMin = rangeMin || 0;
@@ -872,7 +1063,7 @@ see: http://www.w3.org/TR/resource-timing/
 	 * - The relative timepoint and relative pixels are then each Base36 encoded and combined with a ~
 	 * - Finally, the list of timepoints is merged, separated by ! and returned
 	 * @param {object} timePoints An object in the form { "<timePoint>" : [ <object dimensions>, <object dimensions>, ...], <timePoint>: [...], ...}, where <object dimensions> is [height, width, top, left]
-	 * @return {string} The serialized compressed timepoint object with ! separating individual triads and ~ separating timepoint and pixels within the triad. The elements of the triad are the timePoint, number of pixels painted at that point, and the number of pixels finalized at that point (ie, no further paints). If the third part of the triad is 0, it is omitted, if the second part of the triad is 0, it is omitted and the repeated ~~ is replaced with a -
+	 * @returns {string} The serialized compressed timepoint object with ! separating individual triads and ~ separating timepoint and pixels within the triad. The elements of the triad are the timePoint, number of pixels painted at that point, and the number of pixels finalized at that point (ie, no further paints). If the third part of the triad is 0, it is omitted, if the second part of the triad is 0, it is omitted and the repeated ~~ is replaced with a -
 	 */
 	function getOptimizedTimepoints(timePoints) {
 		var i, roundedTimePoints = {}, timeSequence, tPixels,
@@ -937,18 +1128,25 @@ see: http://www.w3.org/TR/resource-timing/
 
 	/**
 	 * Gathers performance entries and compresses the result.
+	 *
 	 * @param [number] from Only get timings from
 	 * @param [number] to Only get timings up to
-	 * @return An object containing the Optimized performance entries trie and the Optimized timepoints array
+	 *
+	 * @returns An object containing the Optimized performance entries trie and
+	 * the optimized server timing lookup
+	 * @memberof BOOMR.plugins.ResourceTiming
 	 */
 	function getCompressedResourceTiming(from, to) {
 		/*eslint no-script-url:0*/
-		var entries = getFilteredResourceTiming(from, to, impl.trackedResourceTypes),
-		    i, e, results = {}, initiatorType, url, data,
-		    timePoints = {};
+		var i, e, results = {}, initiatorType, url, data, timePoints = {};
+		var ret = getFilteredResourceTiming(from, to, impl.trackedResourceTypes);
+		var entries = ret.entries, serverTiming = ret.serverTiming;
 
 		if (!entries || !entries.length) {
-			return {};
+			return {
+				restiming: {},
+				servertiming: []
+			};
 		}
 
 		for (i = 0; i < entries.length; i++) {
@@ -984,7 +1182,7 @@ see: http://www.w3.org/TR/resource-timing/
 				trimTiming(e.domainLookupStart, e.startTime),
 				trimTiming(e.redirectEnd, e.startTime),
 				trimTiming(e.redirectStart, e.startTime)
-			].map(toBase36).join(",").replace(/,+$/, "");
+			].map(toBase36).join(",").replace(/,+$/, ""); // this `replace()` removes any trailing commas
 
 			// add content and transfer size info
 			var compSize = compressSize(e);
@@ -994,6 +1192,29 @@ see: http://www.w3.org/TR/resource-timing/
 
 			if (e.hasOwnProperty("scriptAttrs")) {
 				data += SPECIAL_DATA_PREFIX + SPECIAL_DATA_SCRIPT_ATTR_TYPE + e.scriptAttrs;
+			}
+
+			if (e.serverTiming && e.serverTiming.length) {
+				data += SPECIAL_DATA_PREFIX + SPECIAL_DATA_SERVERTIMING_TYPE +
+					e.serverTiming.reduce(function(stData, entry, entryIndex) {
+						// The numeric of the entry is `value` for Chrome 61, `duration` after that
+						var duration = String(typeof entry.duration !== "undefined" ? entry.duration : entry.value);
+						if (duration.substring(0, 2) === "0.") {
+							// lop off the leading 0
+							duration = duration.substring(1);
+						}
+						// The name of the entry is `metric` for Chrome 61, `name` after that
+						var name = entry.name || entry.metric;
+						var lookupKey = identifyServerTimingEntry(serverTiming.indexed[name].index,
+							serverTiming.indexed[name].descriptions[entry.description]);
+						stData += (entryIndex > 0 ? "," : "") + duration + lookupKey;
+						return stData;
+					}, "");
+			}
+
+
+			if (e.hasOwnProperty("linkAttrs")) {
+				data += SPECIAL_DATA_PREFIX + SPECIAL_DATA_LINK_ATTR_TYPE + e.linkAttrs;
 			}
 
 			url = trimUrl(e.name, impl.trimUrls);
@@ -1026,7 +1247,10 @@ see: http://www.w3.org/TR/resource-timing/
 			}
 		}
 
-		return { restiming: optimizeTrie(convertToTrie(results), true) };
+		return {
+			restiming: optimizeTrie(convertToTrie(results), true),
+			servertiming: serverTiming.lookup
+		};
 	}
 
 	/**
@@ -1076,6 +1300,7 @@ see: http://www.w3.org/TR/resource-timing/
 	 * @param [ResourceTiming[]] resources Resources
 	 *
 	 * @returns Duration, in milliseconds
+	 * @memberof BOOMR.plugins.ResourceTiming
 	 */
 	function calculateResourceTimingUnion(resources) {
 		var i;
@@ -1137,10 +1362,12 @@ see: http://www.w3.org/TR/resource-timing/
 	}
 
 	/**
-	 * Adds 'restiming' to the beacon
+	 * Adds 'restiming' and 'servertiming' to the beacon
 	 *
 	 * @param [number] from Only get timings from
 	 * @param [number] to Only get timings up to
+	 *
+	 * @memberof BOOMR.plugins.ResourceTiming
 	 */
 	function addResourceTimingToBeacon(from, to) {
 		var r;
@@ -1151,21 +1378,232 @@ see: http://www.w3.org/TR/resource-timing/
 		}
 
 		BOOMR.removeVar("restiming");
+		BOOMR.removeVar("servertiming");
 		r = getCompressedResourceTiming(from, to);
 		if (r) {
 			BOOMR.info("Client supports Resource Timing API", "restiming");
-
-			BOOMR.addVar({
-				restiming: JSON.stringify(r.restiming)
-			});
+			addToBeacon(r);
 		}
 	}
+
+	/**
+	 * Given an array of server timing entries (from the resource timing entry),
+	 * [initialize and] increment our count collector of the following format: {
+	 *   "metric-one": {
+	 *     count: 3,
+	 *     counts: {
+	 *       "description-one": 2,
+	 *       "description-two": 1,
+	 *     }
+	 *   }
+	 * }
+	 *
+	 * @param {Object} countCollector Per-beacon collection of counts
+	 * @param {Array} serverTimingEntries Server Timing Entries from a Resource Timing Entry
+	 * @returns nothing
+	 */
+	function accumulateServerTimingEntries(countCollector, serverTimingEntries) {
+		(serverTimingEntries || []).forEach(function(entry) {
+			var name = entry.name || entry.metric;
+			if (typeof countCollector[name] === "undefined") {
+				countCollector[name] = {
+					count: 0,
+					counts: {}
+				};
+			}
+			var metric = countCollector[name];
+			metric.counts[entry.description] = metric.counts[entry.description] || 0;
+			metric.counts[entry.description]++;
+			metric.count++;
+		});
+	}
+
+	/**
+	 * Given our count collector of the format: {
+	 *   "metric-two": {
+	 *     count: 1,
+	 *     counts: {
+	 *       "description-three": 1,
+	 *     }
+	 *   },
+	 *   "metric-one": {
+	 *     count: 3,
+	 *     counts: {
+	 *       "description-one": 1,
+	 *       "description-two": 2,
+	 *     }
+	 *   }
+	 * }
+	 *
+	 * , return the lookup of the following format: [
+	 *   ["metric-one", "description-two", "description-one"],
+	 *   ["metric-two", "description-three"],
+	 * ]
+	 *
+	 * Note: The order of these arrays of arrays matters: there are more server timing entries with
+	 * name === "metric-one" than "metric-two", and more "metric-one"/"description-two" than
+	 * "metric-one"/"description-one".
+	 *
+	 * @param {Object} countCollector Per-beacon collection of counts
+	 * @returns {Array} compressed lookup array
+	 */
+	function compressServerTiming(countCollector) {
+		return Object.keys(countCollector).sort(function(metric1, metric2) {
+			return countCollector[metric2].count - countCollector[metric1].count;
+		}).reduce(function(array, name) {
+			var sorted = Object.keys(countCollector[name].counts).sort(function(description1, description2) {
+				return countCollector[name].counts[description2] -
+					countCollector[name].counts[description1];
+			});
+
+			array.push(sorted.length === 1 && sorted[0] === "" ?
+				name : // special case: no non-empty descriptions
+				[name].concat(sorted));
+			return array;
+		}, []);
+	}
+
+	/**
+	 * Given our lookup of the format: [
+	 *   ["metric-one", "description-one", "description-two"],
+	 *   ["metric-two", "description-three"],
+	 * ]
+	 *
+	 * , create a O(1) name/description to index values lookup dictionary of the format: {
+	 *   metric-one: {
+	 *     index: 0,
+	 *     descriptions: {
+	 *       "description-one": 0,
+	 *       "description-two": 1,
+	 *     }
+	 *   }
+	 *   metric-two: {
+	 *     index: 1,
+	 *     descriptions: {
+	 *       "description-three": 0,
+	 *     }
+	 *   }
+	 * }
+	 *
+	 * @param {Array} lookup compressed lookup array
+	 * @returns {Object} indexed version of the compressed lookup array
+	 */
+	function indexServerTiming(lookup) {
+		return lookup.reduce(function(serverTimingIndex, compressedEntry, entryIndex) {
+			var name, descriptions;
+			if (Array.isArray(compressedEntry)) {
+				name = compressedEntry[0];
+				descriptions = compressedEntry.slice(1).reduce(function(descriptionCollector, description, descriptionIndex) {
+					descriptionCollector[description] = descriptionIndex;
+					return descriptionCollector;
+				}, {});
+			}
+			else {
+				name = compressedEntry;
+				descriptions = {
+					"": 0
+				};
+			}
+
+			serverTimingIndex[name] = {
+				index: entryIndex,
+				descriptions: descriptions
+			};
+			return serverTimingIndex;
+		}, {});
+	}
+
+	/**
+	 * Given entryIndex and descriptionIndex, create the shorthand key into the lookup
+	 * response format is ":<entryIndex>.<descriptionIndex>"
+	 * either/both entryIndex or/and descriptionIndex can be omitted if equal to 0
+	 * the "." can be ommited if descriptionIndex is 0
+	 * the ":" can be ommited if entryIndex and descriptionIndex are 0
+	 *
+	 * @param {Integer} entryIndex index of the entry
+	 * @param {Integer} descriptionIndex index of the description
+	 * @returns {String} key into the compressed lookup
+	 */
+	function identifyServerTimingEntry(entryIndex, descriptionIndex) {
+		var s = "";
+		if (entryIndex) {
+			s += entryIndex;
+		}
+		if (descriptionIndex) {
+			s += "." + descriptionIndex;
+		}
+		if (s.length) {
+			s = ":" + s;
+		}
+		return s;
+	}
+
+	/**
+	 * Adds optimized performance entries trie and (conditionally) the optimized server timing lookup to the beacon
+	 *
+	 * @param {Object} r An object containing the optimized performance entries trie and the optimized server timing
+	 *  lookup
+	 */
+	function addToBeacon(r) {
+		BOOMR.addVar("restiming", JSON.stringify(r.restiming));
+		if (r.servertiming.length) {
+			BOOMR.addVar("servertiming", BOOMR.utils.serializeForUrl(r.servertiming));
+		}
+	}
+
+	/**
+	 * Given our lookup of the format: [
+	 *   ["metric-one", "description-one", "description-two"],
+	 *   ["metric-two", "description-three"],
+	 * ]
+	 *
+	 * , and a key of the format: duration:entryIndex.descriptionIndex,
+	 * return the decompressed server timing entry (name, duration, description)
+	 *
+	 * Note: code only included as POC
+	 *
+	 * @param {Array} lookup compressed lookup array
+	 * @param {Integer} key key into the compressed lookup
+	 * @returns {Object} decompressed resource timing entry (name, duration, description)
+	 */
+	/* BEGIN_DEBUG */
+	function decompressServerTiming(lookup, key) {
+		var split = key.split(":");
+		var duration = Number(split[0]);
+		var entryIndex = 0, descriptionIndex = 0;
+
+		if (split.length > 1) {
+			var identity = split[1].split(".");
+			if (identity[0] !== "") {
+				entryIndex = Number(identity[0]);
+			}
+			if (identity.length > 1) {
+				descriptionIndex = Number(identity[1]);
+			}
+		}
+
+		var name, description = "";
+		if (Array.isArray(lookup[entryIndex])) {
+			name = lookup[entryIndex][0];
+			description = lookup[entryIndex][1 + descriptionIndex] || "";
+		}
+		else {
+			name = lookup[entryIndex];
+		}
+
+		return {
+			name: name,
+			duration: duration,
+			description: description
+		};
+	}
+	/* END_DEBUG */
 
 	impl = {
 		complete: false,
 		sentNavBeacon: false,
 		initialized: false,
-		supported: false,
+		supported: null,
 		xhr_load: function() {
 			if (this.complete) {
 				return;
@@ -1185,6 +1623,7 @@ see: http://www.w3.org/TR/resource-timing/
 		 *  @type {string[]|string}
 		 */
 		trackedResourceTypes: "*",
+		serverTiming: true,
 		done: function() {
 			// Stop if we've already sent a nav beacon (both xhr and spa* beacons
 			// add restiming manually).
@@ -1207,6 +1646,9 @@ see: http://www.w3.org/TR/resource-timing/
 			if (vars.hasOwnProperty("restiming")) {
 				BOOMR.removeVar("restiming");
 			}
+			if (vars.hasOwnProperty("servertiming")) {
+				BOOMR.removeVar("servertiming");
+			}
 
 			if (impl.clearOnBeacon && p) {
 				var clearResourceTimings = p.clearResourceTimings || p.webkitClearResourceTimings;
@@ -1227,23 +1669,38 @@ see: http://www.w3.org/TR/resource-timing/
 	};
 
 	BOOMR.plugins.ResourceTiming = {
+		/**
+		 * Initializes the plugin.
+		 *
+		 * @param {object} config Configuration
+		 * @param {string[]} [config.ResourceTiming.xssBreakWorks] Words that will be broken (by
+		 * ensuring the optimized trie doesn't contain the whole string) in URLs,
+		 * to ensure NoScript doesn't think this is an XSS attack.
+		 *
+		 * Defaults to `DEFAULT_XSS_BREAK_WORDS`.
+		 * @param {boolean} [config.ResourceTiming.clearOnBeacon] Whether or not to clear ResourceTiming
+		 * data on each beacon.
+		 * @param {number} [config.ResourceTiming.urlLimit] URL length limit, after which `...` will be used
+		 * @param {string[]|RegExp[]} [config.ResourceTiming.trimUrls] List of strings of RegExps
+		 * to trim from URLs.
+		 *
+		 * @returns {@link BOOMR.plugins.ResourceTiming} The ResourceTiming plugin for chaining
+		 * @memberof BOOMR.plugins.ResourceTiming
+		 */
 		init: function(config) {
-			var p = BOOMR.getPerformance();
-
 			BOOMR.utils.pluginConfig(impl, config, "ResourceTiming",
-				["xssBreakWords", "clearOnBeacon", "urlLimit", "trimUrls", "trackedResourceTypes"]);
+				["xssBreakWords", "clearOnBeacon", "urlLimit", "trimUrls", "trackedResourceTypes", "serverTiming"]);
 
 			if (impl.initialized) {
 				return this;
 			}
 
-			if (p && typeof p.getEntriesByType === "function") {
+			if (this.is_supported()) {
 				BOOMR.subscribe("page_ready", impl.done, null, impl);
 				BOOMR.subscribe("prerender_to_visible", impl.prerenderToVisible, null, impl);
 				BOOMR.subscribe("xhr_load", impl.xhr_load, null, impl);
-				BOOMR.subscribe("onbeacon", impl.onBeacon, null, impl);
+				BOOMR.subscribe("beacon", impl.onBeacon, null, impl);
 				BOOMR.subscribe("before_unload", impl.done, null, impl);
-				impl.supported = true;
 			}
 			else {
 				impl.complete = true;
@@ -1253,19 +1710,57 @@ see: http://www.w3.org/TR/resource-timing/
 
 			return this;
 		},
+
+		/**
+		 * Whether or not this plugin is complete
+		 *
+		 * @returns {boolean} `true` if the plugin is complete
+		 * @memberof BOOMR.plugins.ResourceTiming
+		 */
 		is_complete: function() {
 			return true;
 		},
-		is_supported: function() {
-			return impl.initialized && impl.supported;
+
+		/**
+		 * Whether or not this ResourceTiming is enabled and supported.
+		 *
+		 * @returns {boolean} `true` if ResourceTiming plugin is enabled.
+		 * @memberof BOOMR.plugins.ResourceTiming
+		 */
+		is_enabled: function() {
+			return impl.initialized && this.is_supported();
 		},
+
+		/**
+		 * Whether or not ResourceTiming is supported in this browser.
+		 *
+		 * @returns {boolean} `true` if ResourceTiming is supported.
+		 * @memberof BOOMR.plugins.ResourceTiming
+		 */
+		is_supported: function() {
+			var p;
+
+			if (impl.supported !== null) {
+				return impl.supported;
+			}
+
+			// check for getEntriesByType and the entry type existing
+			var p = BOOMR.getPerformance();
+			impl.supported = p &&
+			    typeof p.getEntriesByType === "function" &&
+			    typeof window.PerformanceResourceTiming !== "undefined";
+
+			return impl.supported;
+		},
+
 		//
 		// Public Exports
 		//
 		getCompressedResourceTiming: getCompressedResourceTiming,
 		getFilteredResourceTiming: getFilteredResourceTiming,
 		calculateResourceTimingUnion: calculateResourceTimingUnion,
-		addResourceTimingToBeacon: addResourceTimingToBeacon
+		addResourceTimingToBeacon: addResourceTimingToBeacon,
+		addToBeacon: addToBeacon
 
 		//
 		// Test Exports (only for debug)
@@ -1286,13 +1781,21 @@ see: http://www.w3.org/TR/resource-timing/
 		countPixels: countPixels,
 		getOptimizedTimepoints: getOptimizedTimepoints,
 		decompressTimePoints: decompressTimePoints,
+		accumulateServerTimingEntries: accumulateServerTimingEntries,
+		compressServerTiming: compressServerTiming,
+		indexServerTiming: indexServerTiming,
+		identifyServerTimingEntry: identifyServerTimingEntry,
+		decompressServerTiming: decompressServerTiming,
 		SPECIAL_DATA_PREFIX: SPECIAL_DATA_PREFIX,
 		SPECIAL_DATA_DIMENSION_TYPE: SPECIAL_DATA_DIMENSION_TYPE,
 		SPECIAL_DATA_SIZE_TYPE: SPECIAL_DATA_SIZE_TYPE,
 		SPECIAL_DATA_SCRIPT_ATTR_TYPE: SPECIAL_DATA_SCRIPT_ATTR_TYPE,
+		SPECIAL_DATA_LINK_ATTR_TYPE: SPECIAL_DATA_LINK_ATTR_TYPE,
 		ASYNC_ATTR: ASYNC_ATTR,
 		DEFER_ATTR: DEFER_ATTR,
-		LOCAT_ATTR: LOCAT_ATTR
+		LOCAT_ATTR: LOCAT_ATTR,
+		INITIATOR_TYPES: INITIATOR_TYPES,
+		REL_TYPES: REL_TYPES
 		/* END_DEBUG */
 	};
 

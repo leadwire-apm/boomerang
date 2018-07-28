@@ -51,27 +51,12 @@ if (!window.reactDisableBoomerangHook) {
 
 const App = React.createClass({
 	getInitialState() {
-		window.custom_metric_1 = 11;
-		window.custom_metric_2 = function() {
-			return 22;
-		};
-
-		window.custom_timer_1 = 11;
-		window.custom_timer_2 = function() {
-			return 22;
-		};
-
-		if (typeof window.performance !== "undefined" &&
-			typeof window.performance.mark === "function") {
-			window.performance.mark("mark_usertiming");
-		}
-
 		var that = this;
 		if ( window.nav_routes && window.nav_routes.hasOwnProperty("length") && window.nav_routes.length > 0) {
 			if (!subscribed) {
-				BOOMR.subscribe("onbeacon", function(beacon) {
+				BOOMR.subscribe("beacon", function(beacon) {
 					// only continue for SPA beacons
-					if (!BOOMR.utils.inArray(beacon["http.initiator"], BOOMR.constants.BEACON_TYPE_SPAS)) {
+					if (!BOOMR.utils.inArray(beacon["http.initiator"], BOOMR.constants.BEACON_TYPE_SPAS) && !window.call_page_ready) {
 						return;
 					}
 
@@ -101,6 +86,22 @@ const App = React.createClass({
 const Home = React.createClass({
 	getInitialState() {
 		var images;
+
+		// these overwrite what was in the HTML
+		window.custom_metric_1 = 11;
+		window.custom_metric_2 = function() {
+			return 22;
+		};
+
+		window.custom_timer_1 = 11;
+		window.custom_timer_2 = function() {
+			return 22;
+		};
+
+		if (typeof window.performance !== "undefined" &&
+			typeof window.performance.mark === "function") {
+			window.performance.mark("mark_usertiming");
+		}
 
 		if (typeof window.imgs !== "undefined" && window.imgs.hasOwnProperty("length")) {
 			images = window.imgs;
@@ -154,9 +155,29 @@ const Home = React.createClass({
 		}
 		return widgetsElements;
 	},
+	imageOnload() {
+		if (window.call_page_ready && !window.boomr_t_done) {
+			window.boomr_t_done = BOOMR.now();
+			BOOMR.page_ready();
+		}
+	},
 	render() {
 		var widgetsElements = this.renderWidgets();
-
+		if (window.window.late_imgs && !this.state.addedLates) {
+			var rnd = this.state.rnd;
+			this.state.addedLates = true;
+			setTimeout(function() {
+				var content = document.getElementById("root");
+				
+				window.window.late_imgs.forEach(function(imgDelay) {
+					var img = document.createElement("img");
+					if (imgDelay > 0) {
+						img.src = `/delay?delay=${imgDelay}&id=late&file=pages/12-react/support/img.jpg&id=home&rnd=${rnd}`;
+						content.appendChild(img);
+					}
+				});
+			}, 500);
+		}
 		if (!this.state.hide_imgs) {
 			var images = [];
 			for (var delayIndex in  this.state.imgs) {
@@ -166,13 +187,15 @@ const Home = React.createClass({
 				};
 				var src = `/delay?delay=${this.state.imgs[delayIndex]}&file=pages/12-react/support/img.jpg&id=home&rnd=${this.state.rnd}`;
 				images.push(<div className="image-home" key={delayIndex}>
-				  <img key={delayIndex} src={src} style={style}/>
+				  <img onLoad={this.imageOnload} key={delayIndex} src={src} style={style}/>
 				</div>);
 			}
-
 			return (
 				<div className="content">
 					<div dangerouslySetInnerHTML={this.cartMarkup()} />
+					<div class="cart-container" style={{display: "none"}}>
+						<div id="cart-total">$444.44</div>
+					</div>
 					{images}
 					<div>
 						<ul>
@@ -198,9 +221,22 @@ const Home = React.createClass({
 
 const Widget = React.createClass({
 	getInitialState() {
+		var wid = this.props.params.id;
+
+		// these overwrite what was in the HTML
+		window.custom_metric_1 = wid;
+		window.custom_metric_2 = function() {
+			return 10 * wid;
+		};
+
+		window.custom_timer_1 = wid;
+		window.custom_timer_2 = function() {
+			return 10 * wid;
+		};
+
 		return {
 			rnd: '' + (Math.random() * 1000),
-			id: this.props.params.id
+			id: wid
 		};
 	},
 	componentDidMount() {
@@ -224,10 +260,13 @@ const Widget = React.createClass({
 			height: "auto"
 		};
 		var image = <div className="image" key={this.props.params.id}><img key={this.props.params.id} src={`/delay?delay=${this.props.params.id}000&file=pages/12-react/support/img.jpg&id=${this.props.params.id}&rnd=${this.state.rnd}`} style={style}></img></div>;
-
+		var carttotal = this.props.params.id * 11.11;
 		return (
 			<div>
 				<div dangerouslySetInnerHTML={this.widgetMarkup()} />
+				<div class="cart-container" style={{display: "none"}}>
+					<div id="cart-total">${carttotal}</div>
+				</div>
 				{image}
 			</div>
 		);
@@ -242,4 +281,3 @@ var routerInstance = render((
 			</Route>
 		</Router>
 ), document.getElementById("root"));
-

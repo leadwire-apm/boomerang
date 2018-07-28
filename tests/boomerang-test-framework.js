@@ -19,6 +19,7 @@
 		fired_onbeacon: false,
 		fired_before_unload: false,
 		beacons: [],
+		sendBeacons: [],
 		page_ready: function() {
 			this.fired_page_ready = true;
 		},
@@ -45,7 +46,7 @@
 			}
 
 			BOOMR.subscribe("page_ready", this.page_ready, null, this);
-			BOOMR.subscribe("onbeacon", this.onbeacon, null, this);
+			BOOMR.subscribe("beacon", this.onbeacon, null, this);
 			BOOMR.subscribe("before_unload", this.before_unload, null, this);
 
 			this.initialized = true;
@@ -56,6 +57,24 @@
 			return true;
 		}
 	};
+
+	(function() {
+		var savedSendBeacon;
+		if (window.navigator && typeof window.navigator.sendBeacon === "function") {
+			savedSendBeacon = window.navigator.sendBeacon;
+			window.navigator.sendBeacon = function(url, data) {
+				var result = savedSendBeacon.apply(window.navigator, arguments);
+				if (result) {
+					var reader = new FileReader();
+					reader.addEventListener("loadend", function() {
+						BOOMR.plugins.TestFramework.sendBeacons.push(reader.result);
+					});
+					reader.readAsText(data);
+				}
+				return result;
+			};
+		}
+	})();
 })(window);
 
 //
@@ -73,13 +92,15 @@
 
 	var beaconsSeen = 0;
 
+	var doNotTestErrorsParam = false;
+
 	// test framework
 	var assert;
 
 	//
 	// Constants
 	//
-	t.BEACON_URL = "/blackhole";
+	t.BEACON_URL = "/beacon";
 	t.MAX_RESOURCE_WAIT = 500;
 
 	//
@@ -121,7 +142,8 @@
 		beacon_url: t.BEACON_URL,
 		ResourceTiming: {
 			enabled: false
-		}
+		},
+		doNotTestErrorsParam: false
 	};
 
 	t.flattenTestTitles = function(test) {
@@ -183,7 +205,7 @@
 				config.testAfterOnBeacon = 1;
 			}
 
-			BOOMR.subscribe("onbeacon", function() {
+			BOOMR.subscribe("beacon", function() {
 				if (++beaconsSeen === config.testAfterOnBeacon) {
 					// wait a few more ms so the beacon fires
 					// TODO: Trim this timing down if we can make it more reliable
@@ -192,9 +214,13 @@
 			});
 		}
 
-		// initialize boomerang
-		BOOMR.addVar("h.cr", "test");
-		BOOMR.init(config);
+		t.doNotTestErrorsParam = config.doNotTestErrorsParam;
+
+		if (window.BOOMR_LOGN_always !== true) {
+			// initialize boomerang if LOGN is disabled
+			BOOMR.addVar("h.cr", "test");
+			BOOMR.init(config);
+		}
 
 		if (config.onBoomerangLoaded) {
 			config.onBoomerangLoaded();
@@ -203,7 +229,7 @@
 		if (config.afterFirstBeacon) {
 			var xhrSent = false;
 			BOOMR.subscribe(
-				"onbeacon",
+				"beacon",
 				function() {
 					if (xhrSent) {
 						return;
@@ -233,7 +259,7 @@
 
 	t.configureTestEnvironment = function() {
 		// setup Mocha
-		window.mocha.globals(["BOOMR", "PageGroupVariable", "mochaResults", "BOOMR_configt"]);
+		window.mocha.globals(["BOOMR", "PageGroupVariable", "mochaResults", "BOOMR_configt", "_bmrEvents"]);
 		window.mocha.checkLeaks();
 
 		// set globals
@@ -267,7 +293,13 @@
 	};
 
 	t.isResourceTimingSupported = function() {
-		return (window.performance && typeof window.performance.getEntriesByType === "function");
+		return (window.performance &&
+		    typeof window.performance.getEntriesByType === "function" &&
+		    typeof window.PerformanceResourceTiming !== "undefined");
+	};
+
+	t.isServerTimingSupported = function() {
+		return this.isResourceTimingSupported() && typeof PerformanceServerTiming !== "undefined";
 	};
 
 	t.isQuerySelectorSupported = function() {
@@ -278,11 +310,91 @@
 		return typeof BOOMR.plugins.RT.navigationStart() !== "undefined";
 	};
 
+	t.isNavigationTiming2Supported = function() {
+		// check for NavTiming1 first
+		if (!t.isNavigationTimingSupported()) {
+			return false;
+		}
+
+		return window.performance &&
+		    typeof window.performance.getEntriesByType === "function" &&
+		    window.performance.getEntriesByType("navigation").length > 0;
+	};
+
+	t.isNavigationTiming2WithNextHopProtocolSupported = function() {
+		// check for NavTiming1 first
+		if (!t.isNavigationTimingSupported()) {
+			return false;
+		}
+
+		return window.performance &&
+		    typeof window.performance.getEntriesByType === "function" &&
+		    window.performance.getEntriesByType("navigation").length > 0 &&
+		    window.performance.getEntriesByType("navigation")[0].nextHopProtocol;
+	};
+
+	t.isChromeLoadTimesSupported = function() {
+		var pt;
+		if (window.chrome && window.chrome.loadTimes) {
+			pt = window.chrome.loadTimes();
+		}
+
+		if (!pt) {
+			// Not supported
+			return false;
+		}
+
+		return true;
+	};
+
+	t.isPaintTimingSupported = function() {
+		return window.performance &&
+		    typeof window.PerformancePaintTiming !== "undefined" &&
+		    typeof window.performance.getEntriesByType === "function";
+	};
+
+	t.isLongTasksSupported = function() {
+		return window.PerformanceObserver && window.PerformanceLongTaskTiming;
+	};
+
 	t.isUserTimingSupported = function() {
+		// don't check for PerformanceMark or PerformanceMeasure, they aren't polyfilled in usertiming.js
 		return (window.performance &&
-		        typeof window.performance.getEntriesByType === "function" &&
-		        typeof window.performance.mark === "function" &&
-		        typeof window.performance.measure === "function");
+		    typeof window.performance.getEntriesByType === "function" &&
+		    typeof window.performance.mark === "function" &&
+		    typeof window.performance.measure === "function");
+	};
+
+	t.isNetworkAPISupported = function() {
+		return (navigator && typeof navigator === "object" &&
+			navigator.connection ||
+			navigator.mozConnection ||
+			navigator.webkitConnection ||
+			navigator.msConnection);
+	};
+
+	t.isErrorObjInOnErrorSupported = function() {
+		var ua = navigator.userAgent.toLowerCase();
+		return (ua.indexOf("phantomjs") === -1);  // this should be extended to include older IE and Safari
+	};
+
+	t.isLocalStorageSupported = function() {
+		var result = false, name = "_boomr_ilss";
+		try {
+			window.localStorage.setItem(name, name);
+			result = (window.localStorage.getItem(name) === name);
+			window.localStorage.removeItem(name);
+		}
+		catch (ignore) {
+			result = false;
+		}
+		return result;
+	};
+
+	t.isJSONSupported = function() {
+		return (typeof window.JSON === "object" &&
+		    typeof window.JSON.stringify === "function" &&
+		    typeof window.JSON.parse === "function");
 	};
 
 	t.validateBeaconWasImg = function(done) {
@@ -299,7 +411,11 @@
 	};
 
 	t.isMutationObserverSupported = function() {
-		return (window.MutationObserver && typeof window.MutationObserver === "function");
+		var w = window;
+		// Use the same logic as BOOM.utils.isMutationObserverSupported.
+		// Boomerang will not use MO in IE 11 due to browser bugs
+		var ie11 = (w && w.navigator && w.navigator.userAgent && w.navigator.userAgent.match(/Trident.*rv[ :]*11\./));
+		return (!ie11 && w && w.MutationObserver && typeof w.MutationObserver === "function");
 	};
 
 	t.validateBeaconWasXhr = function(done) {
@@ -318,11 +434,11 @@
 	t.validateBeaconWasSent = function(done) {
 		var tf = BOOMR.plugins.TestFramework;
 
-		assert.isTrue(tf.fired_onbeacon, "ensure we fired a beacon ('onbeacon')");
+		assert.isTrue(tf.fired_onbeacon, "ensure we fired a beacon ('beacon')");
 
-		assert.isObject(tf.lastBeacon(), "ensure the data was sent to 'onbeacon'");
+		assert.isObject(tf.lastBeacon(), "ensure the data was sent to 'beacon'");
 
-		assert.isString(tf.lastBeacon().v, "ensure the beacon has basic properties");
+		assert.equal(tf.lastBeacon().v, BOOMR.version, "ensure the beacon has the boomerang version");
 
 		done();
 	};
@@ -337,21 +453,32 @@
 		return (" " + document.cookie + ";").indexOf(" " + testCookieName + "=") !== -1;
 	};
 
-	t.clearCookies = function() {
+	t.clearCookies = function(domain) {
+		var date = new Date();
+		date.setTime(date.getTime() - (24 * 60 * 60 * 1000));
 		var cookies = document.cookie.split(";");
 		for (var i = 0; i < cookies.length; i++) {
-			var name = cookies[i].split("=")[0];
-			document.cookie = [name + "=", "expires" + new Date(), "path=/", "domain=" + location.hostname].join("; ");
+			var name = cookies[i].split("=")[0].trim();
+			document.cookie = [name + "=", "expires=" + date.toGMTString(), "path=/", "domain=" + (domain || location.hostname)].join("; ");
+		}
+	};
+
+	t.clearLocalStorage = function() {
+		// Clear localstorage
+		if (typeof window.localStorage === "object" && typeof window.localStorage.clear === "function") {
+			window.localStorage.clear();
 		}
 	};
 
 	t.parseTimers = function(timers) {
 		var timerValues = {};
 
-		var timersSplit = timers.split(",");
-		for (var i = 0; i < timersSplit.length; i++) {
-			var timerSplit = timersSplit[i].split("|");
-			timerValues[timerSplit[0]] = timerSplit[1];
+		if (timers) {
+			var timersSplit = timers.split(",");
+			for (var i = 0; i < timersSplit.length; i++) {
+				var timerSplit = timersSplit[i].split("|");
+				timerValues[timerSplit[0]] = parseInt(timerSplit[1], 10);
+			}
 		}
 
 		return timerValues;
@@ -563,7 +690,7 @@
 	 *
 	 * @param {string} tagName Tag name
 	 * @param {string} attr Attribute name
-	 * @param {RegEx} regex Regular expression matching the attribute
+	 * @param {RegExp} regex Regular expression matching the attribute
 	 * @returns {number} Number of elements matching
 	 */
 	t.elementsWithAttribute = function(tagName, attr, regex) {
@@ -671,7 +798,7 @@
 	 * @param {string} string - String to search for
 	 * @param {string[]} list - array of strings to test for string
 	 *
-	 * @returns {string[]} - list of strings matching
+	 * @returns {string[]} list of strings matching
 	 */
 	t.checkStringInArray = function(string, list) {
 		return list.filter(function(content) {
@@ -695,9 +822,12 @@
 			var objName = objs[i];
 			var subObj = window.performance[objName];
 
-			copy[objName] = {};
-
 			if (subObj) {
+				if (typeof subObj === "function") {
+					copy[objName] = window.performance[objName];
+					continue;
+				}
+				copy[objName] = {};
 				for (var subObjAttr in subObj) {
 					copy[objName][subObjAttr] = subObj[subObjAttr];
 				}
@@ -707,6 +837,105 @@
 		return copy;
 	};
 
+	/**
+	 * Gets the latest of First Paint or First Contentful Paint
+	 *
+	 * @returns {number} FP or FCP
+	 */
+	t.getFirstOrContentfulPaint = function() {
+		var fp = 0;
+		var p = window.performance;
+
+		// use First Paint (if available)
+		if (BOOMR.plugins.PaintTiming &&
+			BOOMR.plugins.PaintTiming.is_supported() &&
+			p &&
+			p.timeOrigin) {
+			fp = BOOMR.plugins.PaintTiming.getTimingFor("first-contentful-paint");
+			if (!fp) {
+				// or get First Paint directly from PaintTiming
+				fp = BOOMR.plugins.PaintTiming.getTimingFor("first-paint");
+			}
+
+			if (fp) {
+				// convert to epoch
+				fp = Math.round(fp + p.timeOrigin);
+			}
+		}
+		else if (p && p.timing && p.timing.msFirstPaint) {
+			fp = p.timing.msFirstPaint;
+		}
+		else if (window.chrome &&
+			typeof window.chrome.loadTimes === "function") {
+			var loadTimes = window.chrome.loadTimes();
+			if (loadTimes && loadTimes.firstPaintTime) {
+				fp = loadTimes.firstPaintTime * 1000;
+			}
+		}
+
+		return fp;
+	};
+
+	/**
+	 * Do busy work for the specified number of ms
+	 */
+	t.busy = function(ms) {
+		var startTime = (new Date()).getTime();
+		var now = startTime;
+		var endTime = startTime + ms;
+		var math = 1;
+
+		while (now < endTime) {
+			now = (new Date()).getTime();
+			math *= 2;
+			math *= 0.5;
+		}
+	};
+
+	/**
+	 * Determines the user agent is Internet Explorer or not
+	 *
+	 * @returns {boolean} True if the user agent is Internet Explorer
+	 */
+	t.isIE = function() {
+		return window.navigator &&
+			(window.navigator.userAgent.indexOf("MSIE") !== -1 ||
+			window.navigator.appVersion.indexOf("Trident/") > 0);
+	};
+
 	window.BOOMR_test = t;
+
+	// force LOGN plugin not to run. Individual tests will override this if needed.
+	// This only works if the test framework is loaded before boomerang
+	window.BOOMR_LOGN_always = false;
+
+	/*eslint-disable no-extend-native*/
+	// Polyfill via https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Function/bind
+	if (!Function.prototype.bind) {
+		Function.prototype.bind = function(oThis) {
+			if (typeof this !== "function") {
+				// closest thing possible to the ECMAScript 5
+				// internal IsCallable function
+				throw new TypeError("Function.prototype.bind - what is trying to be bound is not callable");
+			}
+
+			var aArgs   = Array.prototype.slice.call(arguments, 1),
+			fToBind = this,
+			fNOP    = function() {},
+			fBound  = function() {
+				return fToBind.apply(this instanceof fNOP ? this : oThis,
+					aArgs.concat(Array.prototype.slice.call(arguments)));
+			};
+
+			if (this.prototype) {
+				// Function.prototype doesn't have a prototype property
+				fNOP.prototype = this.prototype;
+			}
+			fBound.prototype = new fNOP();
+
+			return fBound;
+		};
+	}
+	/*eslint-enable no-extend-native*/
 
 }(window));

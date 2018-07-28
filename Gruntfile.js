@@ -10,14 +10,30 @@ var fse = require("fs-extra");
 var stripJsonComments = require("strip-json-comments");
 var grunt = require("grunt");
 
+
 //
 // Constants
 //
+
+//
+// Domains for test purposes
+//
+var DEFAULT_TEST_MAIN_DOMAIN = "boomerang-test.local";
+var DEFAULT_TEST_SECONDARY_DOMAIN = "boomerang-test2.local";
+
+var boomerangE2ETestDomain = grunt.option("main-domain") || DEFAULT_TEST_MAIN_DOMAIN;
+var boomerangE2ESecondDomain = grunt.option("secondary-domain") || DEFAULT_TEST_SECONDARY_DOMAIN;
+
 var BUILD_PATH = "build";
 var TEST_BUILD_PATH = path.join("tests", "build");
 var TEST_RESULTS_PATH = path.join("tests", "results");
 var TEST_DEBUG_PORT = 4002;
-var TEST_URL_BASE = grunt.option("test-url") || "http://localhost:4002";
+var TEST_URL_BASE = grunt.option("test-url") || "http://" + boomerangE2ETestDomain + ":4002";
+
+var SELENIUM_ADDRESS = grunt.option("selenium-address") || "http://" + boomerangE2ETestDomain + ":4444/wd/hub";
+var E2E_BASE_URL = "http://" + boomerangE2ETestDomain + ":4002/";
+
+var DEFAULT_BROWSER = grunt.option("browser") || "ChromeHeadless";
 
 var DEFAULT_UGLIFY_BOOMERANGJS_OPTIONS = {
 	preserveComments: false,
@@ -37,6 +53,15 @@ var DEFAULT_UGLIFY_BOOMERANGJS_OPTIONS = {
 	compress: {
 		sequences: false
 	}
+};
+
+var SAUCELABS_CONFIG = {
+	username: process.env.CI_SAUCELABS_USERNAME,
+	key: function(){
+		return process.env.CI_SAUCELABS_KEY;
+	},
+	build: process.env.CI_BUILD_NUMBER,
+	tunneled: false
 };
 
 //
@@ -75,7 +100,8 @@ module.exports = function() {
 	//
 	var e2eTests = [];
 	if (grunt.file.exists("tests/e2e/e2e.json")) {
-		e2eTests = JSON.parse(stripJsonComments(grunt.file.read("tests/e2e/e2e.json")));
+		var e2eData = JSON.parse(stripJsonComments(grunt.file.read("tests/e2e/e2e.json")));
+		e2eTests = e2eData.tests || e2eData;
 	}
 	var e2eUrls = [];
 
@@ -87,25 +113,31 @@ module.exports = function() {
 	// Build numbers
 	//
 	var pkg = grunt.file.readJSON("package.json");
-	var buildNumber = grunt.option("buildNumber") || 0;
+	var buildNumber = grunt.option("build-number") || 0;
 	var releaseVersion = pkg.releaseVersion + "." + buildNumber;
-	var buildDate = Math.round(Date.now() / 1000);
-	var boomerangVersion = releaseVersion + "." + buildDate;
+	var buildRevision = grunt.option("build-revision") || 0;
+	var boomerangVersion = releaseVersion + "." + buildRevision;
+	var buildSuffix = grunt.option("build-suffix") ? (grunt.option("build-suffix") + ".") : "";
 
 	//
 	// Output files
 	//
 
 	// build file name is based on the version number
-	var buildFilePrefix = pkg.name + "-" + boomerangVersion;
+	var buildFilePrefix = "boomerang-" + boomerangVersion;
 	var buildPathPrefix = path.join(BUILD_PATH, buildFilePrefix);
 
-	var testBuildFilePrefix = pkg.name;
+	var testBuildFilePrefix = "boomerang";
 	var testBuildPathPrefix = path.join(TEST_BUILD_PATH, testBuildFilePrefix);
 
-	var buildDebug = buildPathPrefix + "-debug.js";
-	var buildRelease = buildPathPrefix + ".js";
-	var buildReleaseMin = buildPathPrefix + ".min.js";
+	var buildDebug = buildPathPrefix + "-debug." + buildSuffix + "js";
+	var buildDebugGz = buildPathPrefix + "-debug." + buildSuffix + "js.gz";
+	var buildDebugMin = buildPathPrefix + "-debug." + buildSuffix + "min.js";
+	var buildDebugMinGz = buildPathPrefix + "-debug." + buildSuffix + "min.js.gz";
+	var buildRelease = buildPathPrefix + "." + buildSuffix + "js";
+	var buildReleaseGz = buildPathPrefix + "." + buildSuffix + "js.gz";
+	var buildReleaseMin = buildPathPrefix + "." + buildSuffix + "min.js";
+	var buildReleaseMinGz = buildPathPrefix + "." + buildSuffix + "min.js.gz";
 	var buildTest = testBuildPathPrefix + "-latest-debug.js";
 	var buildTestMin = testBuildPathPrefix + "-latest-debug.min.js";
 
@@ -113,7 +145,8 @@ module.exports = function() {
 	// Build configuration
 	//
 	var buildConfig = {
-		server: grunt.option("server") || "localhost"
+		server: grunt.option("server") || DEFAULT_TEST_MAIN_DOMAIN || "localhost",
+		beaconUrlsAllowed: grunt.option("beacon-urls-allowed") || ""
 	};
 
 	var bannerFilePathRelative = "./lib/banner.txt";
@@ -135,10 +168,16 @@ module.exports = function() {
 		buildFilePrefix: buildFilePrefix,
 		buildPathPrefix: buildPathPrefix,
 		testBuildPathPrefix: testBuildPathPrefix,
+		buildSuffix: buildSuffix,
 
 		//
 		// Tasks
 		//
+		githash: {
+			main: {
+				options: {}
+			}
+		},
 		concat: {
 			options: {
 				stripBanners: false,
@@ -180,7 +219,9 @@ module.exports = function() {
 				"tests/page-templates/**/*.html",
 				"tests/page-templates/**/*.js",
 				"tests/test-templates/**/*.js",
-				"!tests/page-templates/12-react/support/*"
+				"!tests/page-templates/12-react/support/*",
+				"!tests/page-templates/03-load-order/01-after-page-load.html",  // fails on snippet include
+				"!tests/page-templates/03-load-order/07-after-page-load-boomr-page-ready.html"  // fails on snippet include
 			]
 		},
 		"string-replace": {
@@ -207,14 +248,18 @@ module.exports = function() {
 							replacement: boomerangVersion
 						},
 						{
-							// strip out BOOMR = BOOMR || {}; in plugins
-							pattern: /BOOMR\s*=\s*BOOMR\s*\|\|\s*{};/g,
+							// strip out BOOMR = window.BOOMR || {}; in plugins
+							pattern: /BOOMR\s*=\s*window\.BOOMR\s*\|\|\s*{};/g,
 							replacement: ""
 						},
 						{
 							// strip out BOOMR.plugins = BOOMR.plugins || {}; in plugins
 							pattern: /BOOMR\.plugins\s*=\s*BOOMR\.plugins\s*\|\|\s*{};/g,
 							replacement: ""
+						},
+						{
+							pattern: /beacon_urls_allowed: \[\]/,
+							replacement: "beacon_urls_allowed: [" + buildConfig.beaconUrlsAllowed + "]"
 						}
 					]
 				}
@@ -229,7 +274,7 @@ module.exports = function() {
 						{
 							// Send beacons to null
 							pattern: /beacon_url: .*/,
-							replacement: "beacon_url: \"/blackhole\","
+							replacement: "beacon_url: \"/beacon\","
 						}
 					]
 				}
@@ -315,15 +360,16 @@ module.exports = function() {
 		},
 		uglify: {
 			options: {
-				banner: bannerString + "/* Boomerang Version: <%= boomerangVersion %> */\n"
+				banner: bannerString + "/* Boomerang Version: <%= boomerangVersion %> " +
+					(grunt.option("commit") || "<%= githash.main.hash %>") + " */\n"
 			},
 			default: {
 				options: DEFAULT_UGLIFY_BOOMERANGJS_OPTIONS,
 				files: [{
 					expand: true,
 					cwd: "build/",
-					src: ["<%= buildFilePrefix %>-debug.js",
-					      "<%= buildFilePrefix %>.js"],
+					src: ["<%= buildFilePrefix %>-debug.<%= buildSuffix %>js",
+					      "<%= buildFilePrefix %>.<%= buildSuffix %>js"],
 					dest: "build/",
 					ext: ".min.js",
 					extDot: "last"
@@ -383,19 +429,19 @@ module.exports = function() {
 				files: [
 					{
 						src: buildRelease,
-						dest: "<%= buildPathPrefix %>.js.gz"
+						dest: buildReleaseGz
 					},
 					{
 						src: buildDebug,
-						dest: "<%= buildPathPrefix %>-debug.js.gz"
+						dest: buildDebugGz
 					},
 					{
-						src: "<%= buildPathPrefix %>.min.js",
-						dest: "<%= buildPathPrefix %>.min.js.gz"
+						src: buildReleaseMin,
+						dest: buildReleaseMinGz
 					},
 					{
-						src: "<%= buildPathPrefix %>-debug.min.js",
-						dest: "<%= buildPathPrefix %>-debug.min.js.gz"
+						src: buildDebugMin,
+						dest: buildDebugMinGz
 					}
 				]
 			},
@@ -504,25 +550,54 @@ module.exports = function() {
 				]
 			},
 			unit: {
-				browsers: ["PhantomJS"],
-				frameworks: ["mocha"]
+				browsers: [DEFAULT_BROWSER]
 			},
 			all: {
-				browsers: ["Chrome", "Firefox", "IE", "Opera", "Safari", "PhantomJS"]
+				browsers: [
+					"Chrome",
+					"ChromeHeadless",
+					"Edge",
+					"Firefox",
+					"FirefoxHeadless",
+					"IE",
+					"Opera",
+					"PhantomJS",
+					"Safari",
+					"Edge"
+				]
 			},
-			chrome: {
+			allHeadless: {
+				browsers: [
+					"ChromeHeadless",
+					"FirefoxHeadless",
+					"PhantomJS"
+				]
+			},
+			Chrome: {
 				browsers: ["Chrome"]
 			},
-			ie: {
-				browsers: ["IE"]
+			ChromeHeadless: {
+				browsers: ["ChromeHeadless"]
 			},
-			ff: {
+			Firefox: {
 				browsers: ["Firefox"]
 			},
-			opera: {
+			FirefoxHeadless: {
+				browsers: ["FirefoxHeadless"]
+			},
+			IE: {
+				browsers: ["IE"]
+			},
+			Edge: {
+				browsers: ["Edge"]
+			},
+			Opera: {
 				browsers: ["Opera"]
 			},
-			safari: {
+			PhantomJS: {
+				browsers: ["PhantomJS"]
+			},
+			Safari: {
 				browsers: ["Safari"]
 			},
 			debug: {
@@ -535,14 +610,102 @@ module.exports = function() {
 				noColor: false,
 				keepAlive: false
 			},
-			phantomjs: {
-				configFile: "tests/protractor.config.phantom.js"
+			PhantomJS: {
+				options: {
+					configFile: "tests/protractor.config.phantom.js",
+					args: {
+						seleniumAddress: SELENIUM_ADDRESS,
+						specs: ["tests/e2e/e2e.js"],
+						baseUrl: E2E_BASE_URL,
+						capabilities: {
+							browserName: "phantomjs",
+							"phantomjs.binary.path": require("phantomjs").path
+						}
+					}
+				}
 			},
-			chrome: {
-				configFile: "tests/protractor.config.chrome.js"
+			Chrome: {
+				options: {
+					configFile: "tests/protractor.config.chrome.js",
+					args: {
+						seleniumAddress: SELENIUM_ADDRESS,
+						specs: ["tests/e2e/e2e.js"],
+						baseUrl: E2E_BASE_URL,
+						capabilities: {
+							browserName: "chrome"
+						}
+					}
+				}
+			},
+			ChromeHeadless: {
+				options: {
+					configFile: "tests/protractor.config.chromeheadless.js",
+					args: {
+						seleniumAddress: SELENIUM_ADDRESS,
+						specs: ["tests/e2e/e2e.js"],
+						baseUrl: E2E_BASE_URL
+					}
+				}
+			},
+			Firefox: {
+				options: {
+					configFile: "tests/protractor.config.firefox.js",
+					args: {
+						seleniumAddress: SELENIUM_ADDRESS,
+						specs: ["tests/e2e/e2e.js"],
+						baseUrl: E2E_BASE_URL
+					}
+				}
+			},
+			FirefoxHeadless: {
+				options: {
+					configFile: "tests/protractor.config.firefoxheadless.js",
+					args: {
+						seleniumAddress: SELENIUM_ADDRESS,
+						specs: ["tests/e2e/e2e.js"],
+						baseUrl: E2E_BASE_URL
+					}
+				}
+			},
+			Edge: {
+				options: {
+					configFile: "tests/protractor.config.edge.js",
+					args: {
+						seleniumAddress: SELENIUM_ADDRESS,
+						specs: ["tests/e2e/e2e.js"],
+						baseUrl: E2E_BASE_URL
+					}
+				}
+			},
+			IE: {
+				options: {
+					configFile: "tests/protractor.config.ie.js",
+					args: {
+						seleniumAddress: SELENIUM_ADDRESS,
+						specs: ["tests/e2e/e2e.js"],
+						baseUrl: E2E_BASE_URL
+					}
+				}
+			},
+			Safari: {
+				options: {
+					configFile: "tests/protractor.config.safari.js",
+					args: {
+						seleniumAddress: SELENIUM_ADDRESS,
+						specs: ["tests/e2e/e2e.js"],
+						baseUrl: E2E_BASE_URL
+					}
+				}
 			},
 			debug: {
-				configFile: "tests/protractor.config.debug.js"
+				options: {
+					configFile: "tests/protractor.config.debug.js",
+					args: {
+						seleniumAddress: SELENIUM_ADDRESS,
+						specs: ["tests/e2e/e2e-debug.js"],
+						baseUrl: E2E_BASE_URL
+					}
+				}
 			}
 		},
 		protractor_webdriver: {
@@ -576,49 +739,41 @@ module.exports = function() {
 			}
 		},
 		"saucelabs-mocha": {
-			all: {
-				options: {
-					// username: "", // SAUCE_USERNAME
-					// key: "",      // SAUCE_ACCESS_KEY
-					build: process.env.CI_BUILD_NUMBER,
-					tunneled: false
-				}
-			},
 			unit: {
-				options: {
+				options: Object.assign({
 					urls: [TEST_URL_BASE + "unit/"],
 					testname: "Boomerang Unit Tests",
-					browsers: JSON.parse(stripJsonComments(grunt.file.read("tests/browsers-unit.json")))
-				}
+					browsers: JSON.parse(stripJsonComments(grunt.file.read("./tests/browsers-unit.json")))
+				}, SAUCELABS_CONFIG)
 			},
 			"unit-debug": {
-				options: {
+				options: Object.assign({
 					urls: [TEST_URL_BASE + "unit/"],
 					testname: "Boomerang Unit Tests",
 					browsers: [{
-						"browserName": "internet explorer",
+						browserName: "internet explorer",
 						"version": "11",
 						"platform": "Windows 8.1"
 					}]
-				}
+				}, SAUCELABS_CONFIG)
 			},
 			e2e: {
-				options: {
+				options: Object.assign({
 					urls: e2eUrls,
 					testname: "Boomerang E2E Tests",
 					browsers: JSON.parse(stripJsonComments(grunt.file.read("tests/browsers-unit.json")))
-				}
+				}, SAUCELABS_CONFIG)
 			},
 			"e2e-debug": {
-				options: {
+				options: Object.assign({
 					urls: e2eUrls,
 					testname: "Boomerang E2E Tests",
 					browsers: [{
-						"browserName": "internet explorer",
+						browserName: "internet explorer",
 						"version":     "11",
 						"platform":    "Windows 8.1"
 					}]
-				}
+				}, SAUCELABS_CONFIG)
 			}
 		},
 		jsdoc: {
@@ -629,7 +784,8 @@ module.exports = function() {
 					destination: "build/doc",
 					package: "package.json",
 					readme: "README.md",
-					configure: "jsdoc.conf.json"
+					configure: "jsdoc.conf.json",
+					template: "doc-template"
 				}
 			}
 		},
@@ -642,7 +798,9 @@ module.exports = function() {
 					"tests/unit/**/*",
 					"tests/test-templates/**/*.js",
 					"!tests/page-templates/12-react/support/*.jsx",
-					"!*.#*"
+					"!*.#*",
+					"!*~",
+					"!#*#"
 				],
 				tasks: ["pages-builder"]
 			},
@@ -670,7 +828,8 @@ module.exports = function() {
 				files: [
 					"boomerang.js",
 					"plugins/*.js",
-					"doc/**/**"
+					"doc/**/**",
+					"README.md"
 				],
 				tasks: ["clean", "jsdoc"]
 			}
@@ -697,6 +856,7 @@ module.exports = function() {
 	grunt.loadNpmTasks("grunt-strip-code");
 	grunt.loadNpmTasks("grunt-contrib-watch");
 	grunt.loadNpmTasks("grunt-jsdoc");
+	grunt.loadNpmTasks("grunt-githash");
 
 	// tasks/*.js
 	if (grunt.file.exists("tasks")) {
@@ -712,7 +872,7 @@ module.exports = function() {
 		//
 		// Build
 		//
-		"build": ["concat", "build:apply-templates", "uglify", "string-replace:remove-sourcemappingurl", "compress", "metrics"],
+		"build": ["concat", "build:apply-templates", "githash", "uglify", "string-replace:remove-sourcemappingurl", "compress", "metrics"],
 		"build:test": ["concat:debug", "concat:debug-tests", "!build:apply-templates", "uglify:debug-test-min"],
 
 		// Build steps
@@ -756,20 +916,33 @@ module.exports = function() {
 		"test:karma:debug": ["test:build", "build:test", "karma:debug"],
 
 		// unit tests
-		"test:unit": ["test:build", "build", "karma:unit"],
+		"test:unit": ["test:build", "build", "karma:unit:" + DEFAULT_BROWSER],
 		"test:unit:all": ["build", "karma:all"],
-		"test:unit:chrome": ["build", "karma:chrome"],
-		"test:unit:ff": ["build", "karma:ff"],
-		"test:unit:ie": ["build", "karma:ie"],
-		"test:unit:opera": ["build", "karma:opera"],
-		"test:unit:safari": ["build", "karma:safari"],
+		"test:unit:allHeadless": ["build", "karma:allHeadless"],
+		"test:unit:Chrome": ["build", "karma:Chrome"],
+		"test:unit:ChromeHeadless": ["build", "karma:ChromeHeadless"],
+		"test:unit:Firefox": ["build", "karma:Firefox"],
+		"test:unit:FirefoxHeadless": ["build", "karma:FirefoxHeadless"],
+		"test:unit:Edge": ["build", "karma:Edge"],
+		"test:unit:IE": ["build", "karma:IE"],
+		"test:unit:Opera": ["build", "karma:Opera"],
+		"test:unit:Safari": ["build", "karma:Safari"],
+		"test:unit:PhantomJS": ["build", "karma:PhantomJS"],
 
 		// End-to-End tests
-		"test:e2e": ["test:build", "build", "test:e2e:phantomjs"],
-		"test:e2e:chrome": ["build", "express:dev", "express:secondary", "protractor_webdriver", "protractor:chrome"],
-		"test:e2e:debug": ["build", "test:build", "build:test", "express:dev", "express:secondary", "protractor_webdriver", "protractor:debug"],
-		"test:e2e:phantomjs": ["build", "express:dev", "express:secondary", "protractor_webdriver", "protractor:phantomjs"],
+		"test:e2e": ["test:e2e:" + DEFAULT_BROWSER],
+		"test:e2e:browser": ["test:build", "build", "express:dev", "express:secondary"],
+		"test:e2e:debug": ["test:e2e:browser", "protractor:debug"],
+		"test:e2e:PhantomJS": ["test:e2e:browser", "protractor:PhantomJS"],
+		"test:e2e:Chrome": ["test:e2e:browser", "protractor:Chrome"],
+		"test:e2e:ChromeHeadless": ["test:e2e:browser", "protractor:ChromeHeadless"],
+		"test:e2e:Firefox": ["test:e2e:browser", "protractor:Firefox"],
+		"test:e2e:FirefoxHeadless": ["test:e2e:browser", "protractor:FirefoxHeadless"],
+		"test:e2e:Edge": ["test:e2e:browser", "protractor:Edge"],
+		"test:e2e:IE": ["test:e2e:browser", "protractor:IE"],
+		"test:e2e:Safari": ["test:e2e:browser", "protractor:Safari"],
 
+		// Documentation
 		"test:doc": ["clean", "jsdoc", "express:doc", "watch:doc"],
 
 		// SauceLabs tests
@@ -779,6 +952,11 @@ module.exports = function() {
 		"test:matrix:unit": ["saucelabs-mocha:unit"],
 		"test:matrix:unit:debug": ["saucelabs-mocha:unit-debug"]
 	};
+
+	// launch selenium if another address wasn't provided
+	if (!grunt.option("selenium-address")) {
+		aliases["test:e2e:browser"].push("protractor_webdriver");
+	}
 
 	function isAlias(task) {
 		return aliases[task] ? true : false;
