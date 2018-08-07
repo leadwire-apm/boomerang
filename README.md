@@ -183,6 +183,11 @@ For boomerang, the asynchronous loader snippet you'll use is:
 
   window.BOOMR = window.BOOMR || {};
   window.BOOMR.snippetExecuted = true;
+  
+  // Lead Wire parameters, values are written by the application agent
+  BOOMR_sessionid="sessionid";
+  BOOMR_traceid="traceid";
+  BOOMR_appuuid="appuuid";
 
   var dom, doc, where, iframe = document.createElement("iframe"), win = window;
 
