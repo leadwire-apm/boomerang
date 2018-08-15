@@ -2,7 +2,7 @@
 
 //WDH
 BOOMR.init({
-  beacon_url: "https://data.leadwire.io/rum/"+BOOMR.window.BOOMR_appuuid
+  beacon_url: "https://"+BOOMR.window.BOOMR_apmServer+"/"+BOOMR.window.BOOMR_appuuid+"/rum"
 });
 
 
